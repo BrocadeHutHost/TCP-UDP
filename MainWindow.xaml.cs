@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.IO;
 using System.IO.Ports;
 using System.Net;
@@ -44,8 +44,7 @@ namespace VideoStreamSimulationTransmission
         private bool videoUseTcp = false;
 
         private const int MaxRecvSize = 921600;
-        private const int TcpHeaderSize = 8;  // 1B类型 + 3B保留 + 4B长度
-        private const byte PacketTypeVideoFrame = 0x01;
+        private const int TcpHeaderSize = 4;  // 4字节大端长度头，与TouchSocket兼容
         private int currentFps = 30;
         #endregion
 
@@ -763,15 +762,8 @@ namespace VideoStreamSimulationTransmission
 
                         if (headerOffset >= TcpHeaderSize)
                         {
-                            byte packetType = headerBuf[0];
-                            if (packetType != PacketTypeVideoFrame)
-                            {
-                                // 未知类型，丢弃
-                                expectedFrameLen = 0;
-                                headerOffset = 0;
-                                continue;
-                            }
-                            expectedFrameLen = (headerBuf[4] << 24) | (headerBuf[5] << 16) | (headerBuf[6] << 8) | headerBuf[7];
+                            // 小端序：低位在前
+                            expectedFrameLen = headerBuf[0] | (headerBuf[1] << 8) | (headerBuf[2] << 16) | (headerBuf[3] << 24);
 
                             if (expectedFrameLen <= 0 || expectedFrameLen > MaxRecvSize)
                             {
@@ -824,22 +816,33 @@ namespace VideoStreamSimulationTransmission
 
         private void DisplayVideoFrame(byte[] jpegData)
         {
-            try
+            // 在后台线程解码 JPEG，避免阻塞 UI
+            Task.Run(() =>
             {
-                var bitmap = new BitmapImage();
-                using (var stream = new MemoryStream(jpegData))
+                try
                 {
-                    bitmap.BeginInit();
-                    bitmap.CacheOption = BitmapCacheOption.OnLoad;
-                    bitmap.StreamSource = stream;
-                    bitmap.EndInit();
-                }
-                bitmap.Freeze();
+                    var bitmap = new BitmapImage();
+                    using (var stream = new MemoryStream(jpegData))
+                    {
+                        bitmap.BeginInit();
+                        bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                        bitmap.StreamSource = stream;
+                        bitmap.EndInit();
+                    }
+                    bitmap.Freeze(); // 冻结以便跨线程访问
 
-                imgVideo.Source = bitmap;
-                txtVideoInfo.Visibility = Visibility.Collapsed;
-            }
-            catch { }
+                    // 切回 UI 线程显示
+                    Dispatcher.BeginInvoke(() =>
+                    {
+                        if (!_windowClosing)
+                        {
+                            imgVideo.Source = bitmap;
+                            txtVideoInfo.Visibility = Visibility.Collapsed;
+                        }
+                    });
+                }
+                catch { }
+            });
         }
 
         // ==================== 发送控制 ====================
@@ -960,14 +963,11 @@ namespace VideoStreamSimulationTransmission
                     {
                         try
                         {
-                            tcpHeader[0] = PacketTypeVideoFrame;  // 类型: 视频帧
-                            tcpHeader[1] = 0;                      // 保留
-                            tcpHeader[2] = 0;                      // 保留
-                            tcpHeader[3] = 0;                      // 保留
-                            tcpHeader[4] = (byte)(jpegBytes.Length >> 24);
-                            tcpHeader[5] = (byte)(jpegBytes.Length >> 16);
-                            tcpHeader[6] = (byte)(jpegBytes.Length >> 8);
-                            tcpHeader[7] = (byte)(jpegBytes.Length);
+                            // 小端序：低位在前
+                            tcpHeader[0] = (byte)(jpegBytes.Length);
+                            tcpHeader[1] = (byte)(jpegBytes.Length >> 8);
+                            tcpHeader[2] = (byte)(jpegBytes.Length >> 16);
+                            tcpHeader[3] = (byte)(jpegBytes.Length >> 24);
 
                             tcpSock.Send(tcpHeader);
                             tcpSock.Send(jpegBytes);
@@ -1017,7 +1017,7 @@ namespace VideoStreamSimulationTransmission
         }
 
         /// <summary>
-        /// 停止传输：只停止发送/接收线程，不断开网络
+        /// 停止传输：只停止发送线程，不断开网络连接
         /// </summary>
         private void StopVideoTransmission()
         {
@@ -1033,17 +1033,8 @@ namespace VideoStreamSimulationTransmission
             videoCapture?.Dispose();
             videoCapture = null;
 
-            // 只关闭TCP客户端socket，不关闭服务端监听
-            // UDP socket保持不变
-            if (videoTcpSocket != null && videoTcpListener == null)
-            {
-                // 客户端模式，关闭连接
-                try { videoTcpSocket.Shutdown(SocketShutdown.Both); } catch { }
-                videoTcpSocket.Close();
-                videoTcpSocket = null;
-                isVideoConnected = false;
-                UpdateVideoConnectionState(false, "未连接");
-            }
+            // 不断开网络连接，保持 socket 状态
+            // 用户需要手动点击"断开"按钮才会断开连接
 
             SafeDispatch(() =>
             {
