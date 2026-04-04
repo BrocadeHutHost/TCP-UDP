@@ -44,7 +44,8 @@ namespace VideoStreamSimulationTransmission
         private bool videoUseTcp = false;
 
         private const int MaxRecvSize = 921600;
-        private const int TcpHeaderSize = 4;
+        private const int TcpHeaderSize = 8;  // 1B类型 + 3B保留 + 4B长度
+        private const byte PacketTypeVideoFrame = 0x01;
         private int currentFps = 30;
         #endregion
 
@@ -762,7 +763,15 @@ namespace VideoStreamSimulationTransmission
 
                         if (headerOffset >= TcpHeaderSize)
                         {
-                            expectedFrameLen = (headerBuf[0] << 24) | (headerBuf[1] << 16) | (headerBuf[2] << 8) | headerBuf[3];
+                            byte packetType = headerBuf[0];
+                            if (packetType != PacketTypeVideoFrame)
+                            {
+                                // 未知类型，丢弃
+                                expectedFrameLen = 0;
+                                headerOffset = 0;
+                                continue;
+                            }
+                            expectedFrameLen = (headerBuf[4] << 24) | (headerBuf[5] << 16) | (headerBuf[6] << 8) | headerBuf[7];
 
                             if (expectedFrameLen <= 0 || expectedFrameLen > MaxRecvSize)
                             {
@@ -951,10 +960,14 @@ namespace VideoStreamSimulationTransmission
                     {
                         try
                         {
-                            tcpHeader[0] = (byte)(jpegBytes.Length >> 24);
-                            tcpHeader[1] = (byte)(jpegBytes.Length >> 16);
-                            tcpHeader[2] = (byte)(jpegBytes.Length >> 8);
-                            tcpHeader[3] = (byte)(jpegBytes.Length);
+                            tcpHeader[0] = PacketTypeVideoFrame;  // 类型: 视频帧
+                            tcpHeader[1] = 0;                      // 保留
+                            tcpHeader[2] = 0;                      // 保留
+                            tcpHeader[3] = 0;                      // 保留
+                            tcpHeader[4] = (byte)(jpegBytes.Length >> 24);
+                            tcpHeader[5] = (byte)(jpegBytes.Length >> 16);
+                            tcpHeader[6] = (byte)(jpegBytes.Length >> 8);
+                            tcpHeader[7] = (byte)(jpegBytes.Length);
 
                             tcpSock.Send(tcpHeader);
                             tcpSock.Send(jpegBytes);
